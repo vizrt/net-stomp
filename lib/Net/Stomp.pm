@@ -2,11 +2,12 @@ package Net::Stomp;
 use strict;
 use warnings;
 use IO::Select;
+use POSIX qw(:errno_h);
 use Net::Stomp::Frame;
 use Carp qw(longmess);
 use base 'Class::Accessor::Fast';
 use Log::Any;
-our $VERSION = '0.63.2';
+our $VERSION = '0.63.3';
 
 __PACKAGE__->mk_accessors( qw(
     current_host failover hostname hosts port select serial session_id socket ssl
@@ -134,6 +135,7 @@ sub _get_connection {
 
     $self->select->remove($self->socket);
 
+    $socket->blocking(0);
     $self->select->add($socket);
     $self->socket($socket);
     $self->{_pid} = $$;
@@ -465,7 +467,20 @@ sub send_frame {
     while (length($to_write)) {
         local $SIG{PIPE}='IGNORE'; # just in case writing to a closed
                                    # socket kills us
-        $written = $self->socket->syswrite($to_write);
+        while (1) {
+            $written = $self->socket->syswrite($to_write);
+            if ($! == EWOULDBLOCK) {
+                # Send buffer is full. In most cases it's fine to just loop
+                # here however it's possible to end up in a socket buffer
+                # deadlock scenario if the server is also blocked because the
+                # client's receive buffer is full so let's try to read one
+                # message from the socket before trying again to make sure the
+                # communication can progress.
+                $self->receive_frame({ timeout => 0, force_buffer => 1 });
+                next;
+            }
+            last;
+        }
         last unless defined $written;
         substr($to_write,0,$written,'');
     }
@@ -509,9 +524,13 @@ sub _read_data {
     my ($self, $timeout) = @_;
 
     return unless ($self->ssl && $self->socket->pending()) || $self->select->can_read($timeout);
-    my $len = $self->socket->sysread($self->{_framebuf},
+
+    my $len;
+    do {
+        $len = $self->socket->sysread($self->{_framebuf},
                                      $self->bufsize,
                                      length($self->{_framebuf} || ''));
+    } while ($! == EWOULDBLOCK);
 
     if (defined $len && $len>0) {
         $self->{_framebuf_changed} = 1;
@@ -617,11 +636,13 @@ sub _connected {
 sub receive_frame {
     my ($self, $conf) = @_;
 
-    for (my $i = 0; $i < @{$self->{_messages}}; $i++) {
-        if (!$conf->{command} || $conf->{command} eq $self->{_messages}->[$i]->command) {
-            $self->logger->trace('return buffered frame');
-            my $msg = splice(@{$self->{_messages}}, $i, 1);
-            return $msg;
+    if (!$conf->{force_buffer}) {
+        for (my $i = 0; $i < @{$self->{_messages}}; $i++) {
+            if (!$conf->{command} || $conf->{command} eq $self->{_messages}->[$i]->command) {
+                $self->logger->trace('return buffered frame');
+                my $msg = splice(@{$self->{_messages}}, $i, 1);
+                return $msg;
+            }
         }
     }
 
@@ -635,7 +656,7 @@ sub receive_frame {
     my $done;
     while (1) {
         my $now = time;
-        if (defined $timeout) {
+        if (defined $timeout && !$conf->{force_buffer}) {
             return undef if $now > $timeout_expired;
             $timeout = $timeout_expired - $now;
         }
@@ -644,6 +665,12 @@ sub receive_frame {
         }
         while ( not $done = $self->_read_body ) {
             return undef unless $self->_read_data($timeout);
+        }
+
+        if ($conf->{force_buffer}) {
+            $self->logger->trace('force buffering frame');
+            push @{$self->{_messages}}, $done;
+            return;
         }
 
         # If client requested a specific command we may need to
