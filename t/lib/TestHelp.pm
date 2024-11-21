@@ -58,6 +58,7 @@ sub new {
 }
 sub connected { return $_[0]->{connected} }
 sub close { $_[0]->{connected} = undef; }
+sub blocking { } 
 sub syswrite {
     my ($self,$string) = @_;
     my $ret;
