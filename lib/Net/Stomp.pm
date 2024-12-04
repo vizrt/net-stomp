@@ -7,7 +7,7 @@ use Net::Stomp::Frame;
 use Carp qw(longmess);
 use base 'Class::Accessor::Fast';
 use Log::Any;
-our $VERSION = '0.63.4';
+our $VERSION = '0.63.5';
 
 __PACKAGE__->mk_accessors( qw(
     current_host failover hostname hosts port select serial session_id socket ssl
@@ -205,12 +205,12 @@ sub connect {
         # Setting initial values for session id, as given from
         # the stomp server
         $self->session_id( $frame->headers->{session} );
-        my $server_version = $frame->headers->{'accept-version'};
+        my $server_version = $frame->headers->{'version'};
         if ($server_version) {
             if ($conf->{'accept-version'}) {
-                $self->logger->trace("server accept-version:$server_version");
+                $self->logger->trace("server version:$server_version");
             } else {
-                $self->logger->warn("server responded with accept-version:$server_version despite us not using accept-version");
+                $self->logger->warn("server responded with version:$server_version despite us not using accept-version");
             }
             $self->{_version} = $server_version;
         } else {
